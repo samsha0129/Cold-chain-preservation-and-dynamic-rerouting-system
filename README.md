@@ -1,2 +1,211 @@
-# Cold-chain-preservation-and-dynamic-rerouting-system
-An end-to-end ML system that predicts refrigerated cargo spoilage and auto-reroutes at-risk shipments. Combined a physics-based reefer/spoilage simulator, an XGBoost shelf-life model (76% lower error), and a PyTorch two-tower recommender (90%+ optimal match), wrapped in a live ops dashboard and API.
+# 🧊 Cold-Chain Preservation & Dynamic Rerouting System
+
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Status](https://img.shields.io/badge/status-research%20prototype-orange)
+
+An end-to-end machine learning and optimization system that predicts food spoilage in
+refrigerated intermodal containers ("reefers") in real time and recommends diversion
+routes before cargo becomes unsellable.
+
+Every year, an enormous volume of perishable freight — produce, seafood, dairy — is
+lost in transit to equipment failures, delays, and misconfigured containers, often
+discovered only after the cargo has already spoiled. This project treats that as a
+monitoring and control problem: estimate the true physical state of a shipment from
+imperfect sensor data, project it forward to arrival, and — when a load is at risk —
+rank the best alternative buyers by projected salvage value, factoring in distance,
+demand, and the real cost of diverting from a committed order.
+
+The system is built in four layers, each a standalone, runnable module:
+
+1. **`data_engine.py`** — a physics-grounded telemetry simulator
+2. **`spoilage_model.py`** — a physics-informed XGBoost shelf-life regressor
+3. **`recommender.py`** — a two-tower PyTorch diversion recommender
+4. **`fleet_service.py` / `app.py` / `api.py`** — a Streamlit operations dashboard and FastAPI service
+
+---
+
+## Key Features
+
+- **Physics-grounded data, not arbitrary synthetic data.** Reefer thermodynamics are
+  modeled as a two-node (air/cargo) lumped thermal system with compressor capacity,
+  defrost cycles, door openings, and power loss. Spoilage follows the Arrhenius
+  kinetic equation, calibrated to USDA Agriculture Handbook 66 storage data for six
+  commodities (strawberries, blueberries, iceberg lettuce, avocados, bananas, fresh
+  salmon). The logistics network is built from 59 real North American ports, rail
+  ramps, border crossings, and wholesale terminal markets, connected by corridors
+  actual Class I railroads operate.
+- **A virtual pulp sensor.** Spoilage depends on cargo temperature, but many reefers
+  only report air temperature, which lags cargo by hours. A first-order thermal
+  observer reconstructs cargo temperature from the air signal, closing the gap for
+  fleets without a physical pulp probe.
+- **A physics-informed shelf-life model.** XGBoost learns the *residual* on top of an
+  Arrhenius-derived physics prior, rather than modeling shelf life from scratch. A
+  validation gate automatically falls back to the physics-only estimate if the
+  learned correction doesn't actually improve on it for a given fleet variant.
+- **Lot-to-lot biological variability.** Each shipment draws its own latent shelf-life
+  factor and temperature sensitivity, and load-out quality-control readings carry
+  realistic measurement noise — so the dataset doesn't assume every lot of a
+  commodity behaves identically.
+- **An economically grounded diversion recommender.** A two-tower neural network
+  (shipment state × receiving-hub state) retrieves candidate buyers by learned
+  similarity; an exact salvage-economics model re-ranks them, accounting for
+  projected revenue, incremental freight, contract-breach cost, and disposal cost.
+  A SciPy linear-assignment solver then allocates an entire at-risk fleet jointly, so
+  multiple containers don't all compete for the same buyer's capacity.
+- **A real operations interface**, not just a model demo — a Streamlit dashboard with
+  a live fleet map, per-container sensor and shelf-life history, ranked buyer
+  options, and an auditable decision log, backed by a FastAPI service for
+  integration with external systems (TMS, carrier portals, alerting).
+- **Engineering rigor throughout** — grouped (container-level) train/val/test splits
+  to prevent trajectory leakage, explicit leakage-column checks, full type coverage
+  (clean `mypy --strict`-style pass), and ablation studies that isolate the
+  contribution of each feature layer.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Data processing | Python 3.10+, Pandas, NumPy |
+| Logistics network & routing | NetworkX, SciPy (`linear_sum_assignment`) |
+| Shelf-life regression | XGBoost |
+| Diversion recommender | PyTorch (two-tower embedding architecture) |
+| Dashboard | Streamlit, Plotly |
+| API | FastAPI, Uvicorn |
+| Storage | Parquet (via PyArrow), with CSV fallback |
+
+---
+
+## Project Structure
+
+```
+.
+├── data_engine.py        # Phase 1 — telemetry simulator & logistics network
+├── spoilage_model.py     # Phase 2 — XGBoost shelf-life regressor
+├── recommender.py        # Phase 3 — two-tower diversion recommender
+├── fleet_service.py      # Phase 4 — shared operational logic
+├── app.py                # Phase 4 — Streamlit dashboard
+├── api.py                # Phase 4 — FastAPI REST service
+├── requirements.txt
+├── data/                 # generated by data_engine.py (not committed)
+└── models/               # generated by spoilage_model.py / recommender.py (not committed)
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.10 or later
+- ~2 GB free disk space (telemetry and model artifacts)
+- No GPU required — everything runs on CPU in a few minutes
+
+### Installation
+
+```bash
+git clone https://github.com/<your-username>/cold-chain-rerouting.git
+cd cold-chain-rerouting
+
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+pip install -r requirements.txt
+```
+
+### Build the pipeline
+
+The three modeling phases must be run **in order** — each writes artifacts the next
+phase reads.
+
+```bash
+# Phase 1: generate the telemetry dataset (~5 s for 400 containers)
+python data_engine.py --containers 400 --out-dir data
+
+# Phase 2: train the shelf-life regressor (~20 s)
+python spoilage_model.py --data-dir data --model-dir models
+
+# Phase 3: train the diversion recommender (~3-4 min on CPU)
+python recommender.py --data-dir data --model-dir models
+```
+
+No environment variables are required for the modeling pipeline. The API reads two
+optional ones for where to find the generated artifacts:
+
+```bash
+export COLDCHAIN_DATA_DIR=data      # defaults to "data"
+export COLDCHAIN_MODEL_DIR=models   # defaults to "models"
+```
+
+---
+
+## Usage
+
+### Launch the dashboard
+
+```bash
+streamlit run app.py -- --data-dir data --model-dir models
+```
+
+Opens at `http://localhost:8501` with three tabs:
+
+- **Fleet operations** — live map and action queue, color-coded by model-predicted
+  status (green/amber/red), with a simulation clock to replay the fleet over time
+- **Container detail** — temperature/humidity/shock history, forward shelf-life
+  projections, ranked secondary buyers with salvage economics, and an
+  approve/keep-on-plan decision form
+- **Model health** — ablation results, feature importance, and recommender
+  evaluation metrics
+
+### Launch the API
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+Interactive docs at `http://localhost:8000/docs`. Example calls:
+
+```bash
+# Fleet summary, filtered to at-risk containers
+curl "http://localhost:8000/fleet?status=amber&status=red"
+
+# Diversion options for one container
+curl "http://localhost:8000/containers/SYNU1003701/recommendations"
+
+# Record an operator decision
+curl -X POST "http://localhost:8000/containers/SYNU1003701/decisions" \
+     -H "Content-Type: application/json" \
+     -d '{"buyer_code": "PHL_WPM", "operator": "A. Shah", "note": "confirmed receiving slot"}'
+```
+
+### Model performance
+
+| Shelf-life model (Phase 2) | RMSE (days) |
+|---|---|
+| 6-hour rolling stats only (naive baseline) | 2.86 |
+| + cumulative exposure + load-out QC | 0.36 |
+| + Arrhenius integration (virtual pulp sensor) | **0.68** (76% lower than baseline) |
+
+The production target of 0.25-day RMSE is reachable (0.09 d) when load-out quality
+control is near-exact; with realistic ±5% QC measurement noise, error rises to
+~0.69 d. In other words, the error floor is set by how precisely shelf life is
+assessed at loading, not by the model.
+
+| Diversion recommender (Phase 3) | Result |
+|---|---|
+| Oracle-optimal buyer in top-5 shortlist | 94–100% of held-out shipments |
+| Matches oracle's exact choice | ~90%+ |
+| Net value captured vs. simple heuristics (nearest buyer, largest deficit) | Outperforms both |
+
+Full ablation and evaluation tables are written to `models/ablation.csv`,
+`models/feature_importance.csv`, and `models/recommender_eval.csv` after training.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE) — see the `LICENSE` file
+for details. (Swap in your preferred license before publishing if MIT isn't the
+right fit for this repository.)
